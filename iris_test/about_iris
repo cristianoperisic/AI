@@ -1,0 +1,8 @@
+iris(붓꽃) 에는
+setosa, versicolor, virginica 세 품종이 있음
+
+이 데이터 셋을 scikit-learn 에서 제공해서 한번 해볼 예정
+
+load_iris 이용
+
+classification 모델임
