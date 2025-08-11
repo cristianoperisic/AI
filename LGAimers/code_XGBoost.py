@@ -1,4 +1,8 @@
 # -*- coding: utf-8 -*-
+import warnings
+
+warnings.filterwarnings("ignore", category=FutureWarning)
+
 import pandas as pd
 import numpy as np
 from pathlib import Path
@@ -32,18 +36,18 @@ train["item_id"] = le.fit_transform(train["영업장명_메뉴명"])
 
 # ===== 날짜/주기 특징 =====
 def make_date_feats(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-    df["year"] = df["영업일자"].dt.year
-    df["month"] = df["영업일자"].dt.month
-    df["day"] = df["영업일자"].dt.day
-    df["weekday"] = df["영업일자"].dt.weekday
-    df["is_weekend"] = df["weekday"].isin([5, 6]).astype(int)
+    out = df.copy()
+    out["year"] = out["영업일자"].dt.year
+    out["month"] = out["영업일자"].dt.month
+    out["day"] = out["영업일자"].dt.day
+    out["weekday"] = out["영업일자"].dt.weekday  # 0=월, 6=일
+    out["is_weekend"] = out["weekday"].isin([5, 6]).astype(int)
     # 주기성(월/요일) 사인/코사인
-    df["month_sin"] = np.sin(2 * np.pi * df["month"] / 12.0)
-    df["month_cos"] = np.cos(2 * np.pi * df["month"] / 12.0)
-    df["wday_sin"] = np.sin(2 * np.pi * df["weekday"] / 7.0)
-    df["wday_cos"] = np.cos(2 * np.pi * df["weekday"] / 7.0)
-    return df
+    out["month_sin"] = np.sin(2 * np.pi * out["month"] / 12.0)
+    out["month_cos"] = np.cos(2 * np.pi * out["month"] / 12.0)
+    out["wday_sin"] = np.sin(2 * np.pi * out["weekday"] / 7.0)
+    out["wday_cos"] = np.cos(2 * np.pi * out["weekday"] / 7.0)
+    return out
 
 
 # ===== Train용 Lag & Rolling =====
@@ -51,31 +55,18 @@ train = make_date_feats(train)
 train = train.sort_values(["item_id", "영업일자"])
 
 for lag in [1, 7, 14]:
-    train[f"lag{lag}"] = train.groupby("item_id")["매출수량"].shift(lag)
+    train[f"lag{lag}"] = train.groupby("item_id", observed=True)["매출수량"].shift(lag)
 
 # rolling은 누수 방지 위해 shift(1) 이후 rolling
-train["roll7_mean"] = (
-    train.groupby("item_id")["매출수량"]
-    .shift(1)
-    .rolling(7)
-    .mean()
-    .reset_index(0, drop=True)
+g = train.groupby("item_id", observed=True)["매출수량"]
+train["roll7_mean"] = g.shift(1).rolling(7).mean().reset_index(0, drop=True)
+train["roll14_mean"] = g.shift(1).rolling(14).mean().reset_index(0, drop=True)
+train["roll7_std"] = g.shift(1).rolling(7).std().reset_index(0, drop=True)
+
+# 학습에 쓸 수 없는 결측 드롭
+train = train.dropna(
+    subset=["lag1", "lag7", "lag14", "roll7_mean", "roll14_mean", "roll7_std"]
 )
-train["roll14_mean"] = (
-    train.groupby("item_id")["매출수량"]
-    .shift(1)
-    .rolling(14)
-    .mean()
-    .reset_index(0, drop=True)
-)
-train["roll7_std"] = (
-    train.groupby("item_id")["매출수량"]
-    .shift(1)
-    .rolling(7)
-    .std()
-    .reset_index(0, drop=True)
-)
-train = train.dropna()
 
 feature_cols = [
     "year",
@@ -98,25 +89,26 @@ feature_cols = [
 X = train[feature_cols]
 y = train["매출수량"].astype(float)
 
-# ===== XGBoost 파라미터 =====
+# ===== GPU 유무에 따른 안전한 파라미터 설정 =====
+try:
+    import torch
+
+    HAS_CUDA = torch.cuda.is_available()
+except Exception:
+    HAS_CUDA = False
+
 params = {
     "objective": "reg:squarederror",
     "eval_metric": "rmse",
-    "tree_method": "gpu_hist",  # GPU가 없으면 아래 try/except에서 cpu_hist로 변경
-    "predictor": "gpu_predictor",
+    # XGBoost 2.x 권장: tree_method="hist" + device 설정
+    "tree_method": "hist",
+    "device": "cuda" if HAS_CUDA else "cpu",
     "max_depth": 8,
     "learning_rate": 0.05,
     "subsample": 0.8,
     "colsample_bytree": 0.8,
     "seed": 42,
 }
-
-# GPU 미지원 환경 대비
-try:
-    _ = xgb.DeviceQuantileDMatrix(X, y)  # 빠르게 체크
-except Exception:
-    params["tree_method"] = "hist"
-    params["predictor"] = "auto"
 
 # ===== TimeSeriesSplit CV로 best_iteration 찾기 =====
 tscv = TimeSeriesSplit(n_splits=5)
@@ -184,29 +176,13 @@ for test_name, test_df in tests.items():
                 how="left",
             )
 
-        # rolling mean/std: (영업일자, item_id) 맞춰 당일의 roll을 미리 precompute
-        # 간단히 최근 14일만 써서 계산(속도/메모리 절충)
-        # history에는 step-1까지의 예측이 누적되므로 점점 풍부해짐
+        # rolling mean/std 계산
         roll_base = history.sort_values(["item_id", "영업일자"]).copy()
-        roll_base["roll7_mean"] = (
-            roll_base.groupby("item_id")["매출수량"]
-            .rolling(7)
-            .mean()
-            .reset_index(0, drop=True)
-        )
-        roll_base["roll14_mean"] = (
-            roll_base.groupby("item_id")["매출수량"]
-            .rolling(14)
-            .mean()
-            .reset_index(0, drop=True)
-        )
-        roll_base["roll7_std"] = (
-            roll_base.groupby("item_id")["매출수량"]
-            .rolling(7)
-            .std()
-            .reset_index(0, drop=True)
-        )
-        # 하루 뒤에 쓰일 값이므로 날짜+1 셔프트
+        gb = roll_base.groupby("item_id", observed=True)["매출수량"]
+        roll_base["roll7_mean"] = gb.rolling(7).mean().reset_index(0, drop=True)
+        roll_base["roll14_mean"] = gb.rolling(14).mean().reset_index(0, drop=True)
+        roll_base["roll7_std"] = gb.rolling(7).std().reset_index(0, drop=True)
+        # 하루 뒤 사용이므로 날짜+1
         roll_base["영업일자"] = roll_base["영업일자"] + pd.Timedelta(days=1)
 
         frame = frame.merge(
@@ -218,20 +194,16 @@ for test_name, test_df in tests.items():
         )
 
         # 결측 보정
-        frame[["lag1", "lag7", "lag14", "roll7_mean", "roll14_mean", "roll7_std"]] = (
-            frame[
-                ["lag1", "lag7", "lag14", "roll7_mean", "roll14_mean", "roll7_std"]
-            ].fillna(0)
-        )
+        fill_cols = ["lag1", "lag7", "lag14", "roll7_mean", "roll14_mean", "roll7_std"]
+        frame[fill_cols] = frame[fill_cols].fillna(0)
 
         X_pred = frame[feature_cols]
         dpred = xgb.DMatrix(X_pred)
         yhat = final_model.predict(dpred)
-
-        # 음수 방지
-        yhat = np.clip(yhat, 0, None)
+        yhat = np.clip(yhat, 0, None)  # 음수 방지
 
         frame["pred"] = yhat
+
         # 예측을 history에 누적(다음 step의 lag/rolling 계산에 사용)
         add_hist = frame[["영업일자", "item_id", "영업장명_메뉴명", "pred"]].rename(
             columns={"pred": "매출수량"}
@@ -253,6 +225,6 @@ for test_name, test_df in tests.items():
 submission = pd.concat(all_preds)
 submission = submission.reset_index().rename(columns={"index": "영업일자"})
 submission = submission[sample.columns]  # 컬럼 순서/이름 맞추기
-out_path = BASE_DIR / "submission_xgboost_recursive.csv"
+out_path = BASE_DIR / "submission_xgboost_recursive2.csv"
 submission.to_csv(out_path, index=False, encoding="utf-8-sig")
 print(f"✅ XGBoost 재귀예측 제출 파일 저장 완료: {out_path}")
